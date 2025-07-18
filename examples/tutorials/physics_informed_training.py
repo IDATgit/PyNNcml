@@ -20,7 +20,7 @@
 import sys
 import os
 
-top_folder = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+top_folder = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if os.path.exists(top_folder):
     print("Import PyNNCML From Code")
     sys.path.append(top_folder)  # This line is need to import pynncml
@@ -49,9 +49,9 @@ cnn_layers = 3  # @param{type:"integer"} - Number of CNN layers
 fc_hidden_size = 256  # @param{type:"integer"} - FC hidden layer size
 fc_layers = 3  # @param{type:"integer"} - Number of FC layers
 metadata_n_features = 32  # @param{type:"integer"}
-lr = 1e-4  # @param{type:"number"}
+lr = 3e-4  # @param{type:"number"}
 weight_decay = 1e-4  # @param{type:"number"}
-n_epochs = 2  # @param{type:"integer"}
+n_epochs = 100  # @param{type:"integer"}
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # Building Training and Validation datasets
@@ -159,6 +159,7 @@ class SimpleFC(nn.Module):
         layers.append(nn.Linear(hidden_size, 1))  # Output rain rate
         
         self.fc_layers = nn.Sequential(*layers)
+        self.relu = nn.ReLU()
         
     def forward(self, attenuation, metadata):
         batch_size, seq_len = attenuation.shape
@@ -178,6 +179,7 @@ class SimpleFC(nn.Module):
         # Apply FC to each time step
         combined_flat = combined.view(-1, 1 + meta_features.shape[-1])  # [batch_size * seq_len, features]
         output_flat = self.fc_layers(combined_flat)  # [batch_size * seq_len, 1]
+        output_flat_relu = self.relu(output_flat)
         output = output_flat.view(batch_size, seq_len)  # [batch_size, seq_len]
         
         return output
@@ -284,10 +286,8 @@ class EnhancedRainEstimationLoss(nn.Module):
     
     def __init__(self, 
                  exp_gamma: float,
-                 rain_weight: float = 10.0,  # Higher weight for minority rain samples
-                 clean_atten_weight: float = 1.0,
-                 zero_input_weight: float = 1.0,
-                 physical_weight: float = 1.0,
+                 rain_weight: float = 1.0,  # Higher weight for minority rain samples
+                 clean_atten_weight: float = 0.1,
                  gamma_s: float = 0.9):
         
         super(EnhancedRainEstimationLoss, self).__init__()
@@ -295,8 +295,6 @@ class EnhancedRainEstimationLoss(nn.Module):
         self.exp_gamma = exp_gamma
         self.rain_weight = rain_weight
         self.clean_atten_weight = clean_atten_weight
-        self.zero_input_weight = zero_input_weight
-        self.physical_weight = physical_weight
         self.gamma_s = gamma_s
         
     def forward(self, model_output: dict, rain_target: torch.Tensor):
@@ -311,8 +309,8 @@ class EnhancedRainEstimationLoss(nn.Module):
         clean_attenuation = model_output['clean_attenuation']
         
         # 1. Main rain estimation loss with imbalance weighting
-        rain_mask = (rain_target > 0.1).float()
-        dry_mask = (rain_target <= 0.1).float()
+        rain_mask = (rain_target != 0).bool()
+        dry_mask = ~rain_mask
         
         delta = (rain_target - rain_pred) ** 2
         weight = 1 - self.gamma_s * torch.exp(-self.exp_gamma * rain_target)
@@ -327,36 +325,16 @@ class EnhancedRainEstimationLoss(nn.Module):
         # 2. Clean attenuation regularization (should be ~0 during dry periods)
         clean_atten_loss = torch.mean(dry_mask * clean_attenuation ** 2)
         
-        # 3. FC zero-input regularization (zero clean attenuation -> zero rain prediction)
-        zero_atten_mask = (torch.abs(clean_attenuation) < 0.01).float()
-        zero_input_loss = torch.mean(zero_atten_mask * rain_pred ** 2)
-        
-        # 4. Physical constraints
-        # Non-negative rain rates
-        negative_rain_penalty = torch.mean(F.relu(-rain_pred) ** 2)
-        
-        # Non-negative clean attenuation (physical constraint)
-        negative_atten_penalty = torch.mean(F.relu(-clean_attenuation) ** 2)
-        
-        # Extreme value penalties
-        extreme_rain_penalty = torch.mean(F.relu(rain_pred - 100) ** 2)  # Cap at 100 mm/hr
-        extreme_atten_penalty = torch.mean(F.relu(torch.abs(clean_attenuation) - 50) ** 2)  # Cap at 50 dB
-        
-        physical_loss = (negative_rain_penalty + negative_atten_penalty + 
-                        extreme_rain_penalty + extreme_atten_penalty)
         
         # Combine all losses
         total_loss = (rain_loss + 
                      self.clean_atten_weight * clean_atten_loss +
-                     self.zero_input_weight * zero_input_loss +
-                     self.physical_weight * physical_loss)
+                     self.rain_weight * rain_loss)
         
         return {
             'total_loss': total_loss,
             'rain_loss': rain_loss,
             'clean_atten_loss': clean_atten_loss,
-            'zero_input_loss': zero_input_loss,
-            'physical_loss': physical_loss
         }
 
 
@@ -381,8 +359,6 @@ def load_checkpoint(checkpoint_path, model, optimizer=None):
     print(f"  Total Loss: {checkpoint['total_loss']:.4f}")
     print(f"  Rain Loss: {checkpoint['rain_loss']:.4f}")
     print(f"  Clean Attenuation Loss: {checkpoint['clean_atten_loss']:.4f}")
-    print(f"  Zero Input Loss: {checkpoint['zero_input_loss']:.4f}")
-    print(f"  Physical Loss: {checkpoint['physical_loss']:.4f}")
     
     return checkpoint
 
@@ -553,6 +529,7 @@ def load_latest_checkpoint_and_analyze(checkpoint_dir, model, val_loader, device
 
 # Build the model
 
+
 model = CNNFCRainEstimator(
     n_samples=window_size,  # 32 samples per window
     cnn_n_filters=cnn_n_filters,
@@ -561,14 +538,14 @@ model = CNNFCRainEstimator(
     fc_layers=fc_layers,
     metadata_n_features=metadata_n_features
 ).to(device)
+print("Rain estimation model: ")
+print(model)
 
 # Enhanced loss function
 loss_function = EnhancedRainEstimationLoss(
     exp_gamma=exp_gamma,
-    rain_weight=10.0,  # Higher weight for rain samples
-    clean_atten_weight=1.0,
-    zero_input_weight=1.0,
-    physical_weight=0.1
+    rain_weight=1.0,  # Higher weight for rain samples
+    clean_atten_weight=0.1
 )
 
 # Training Loop
@@ -632,17 +609,20 @@ else:
                     total_loss=total_loss.item(),
                     rain_loss=loss_dict['rain_loss'].item(),
                     clean_atten_loss=loss_dict['clean_atten_loss'].item(),
-                    zero_input_loss=loss_dict['zero_input_loss'].item(),
-                    physical_loss=loss_dict['physical_loss'].item()
                 )
         
         # Store epoch results
         ra.add_results(
             total_loss=am.get_results("total_loss"),
             rain_loss=am.get_results("rain_loss"),
-            clean_atten_loss=am.get_results("clean_atten_loss"),
-            zero_input_loss=am.get_results("zero_input_loss"),
-            physical_loss=am.get_results("physical_loss")
+        )
+        
+        # Print epoch-level training losses (all components)
+        print(
+            f"Epoch {epoch + 1}/{n_epochs} | Train Losses -> "
+            f"Total: {am.get_results('total_loss'):.4f} | "
+            f"Rain: {am.get_results('rain_loss'):.4f} | "
+            f"CleanAtten: {am.get_results('clean_atten_loss'):.4f} | "
         )
         
         # Save checkpoint every 2 epochs
@@ -655,8 +635,6 @@ else:
                 'total_loss': am.get_results("total_loss"),
                 'rain_loss': am.get_results("rain_loss"),
                 'clean_atten_loss': am.get_results("clean_atten_loss"),
-                'zero_input_loss': am.get_results("zero_input_loss"),
-                'physical_loss': am.get_results("physical_loss"),
                 'hyperparameters': {
                     'batch_size': batch_size,
                     'window_size': window_size,
@@ -719,6 +697,7 @@ except KeyError:
 
 model.eval()
 ga = pnc.metrics.GroupAnalysis()
+val_am = pnc.metrics.AverageMetric()  # Accumulator for validation losses
 with torch.no_grad():
     all_rain_ref = []
     all_rain_pred = []
@@ -747,6 +726,14 @@ with torch.no_grad():
             all_baseline_corr.append(baseline_corr.detach().cpu().numpy())
             
             ga.append(_rr.detach().cpu().numpy(), rain_pred.detach().cpu().numpy())
+            
+            # Accumulate validation loss components
+            val_loss_dict = loss_function(model_output, _rr)
+            val_am.add_results(
+                total_loss=val_loss_dict['total_loss'].item(),
+                rain_loss=val_loss_dict['rain_loss'].item(),
+                clean_atten_loss=val_loss_dict['clean_atten_loss'].item()
+            )
 
 # Combine all validation results
 rain_ref_array = np.concatenate(all_rain_ref, axis=0)
@@ -770,6 +757,12 @@ print(f"MSE: {mse:.4f}")
 print(f"RMSE: {np.sqrt(mse):.4f}")
 print(f"Bias: {bias:.4f}")
 print(f"Correlation: {correlation:.4f}")
+
+# Print aggregated validation losses
+print("\nValidation Losses -> "
+      f"Total: {val_am.get_results('total_loss'):.4f}, "
+      f"Rain: {val_am.get_results('rain_loss'):.4f}, "
+      f"CleanAtten: {val_am.get_results('clean_atten_loss'):.4f}, ")
 
 # Analysis plots - Full Time Series
 

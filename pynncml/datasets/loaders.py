@@ -64,8 +64,11 @@ def transform_open_mrg(fn, path_to_extract_to):
     # For this ZIP file we cannot extract only the CML dataset since
     # the NetCDF with the CML dataset is quite large. This seems to
     # lead to crashes when reding directly from the ZIP file via Python.
-    with zipfile.ZipFile(fn) as zfile:
-        zfile.extractall(path_to_extract_to)
+    if not os.path.exists(os.path.join(path_to_extract_to, 'cml/cml_metadata.csv')):
+        with zipfile.ZipFile(fn) as zfile:
+            zfile.extractall(path_to_extract_to)
+    else:
+        print("OpenMRG dataset already extracted to", path_to_extract_to)
 
     # Read metadata and dataset
     df_metadata = pd.read_csv(os.path.join(path_to_extract_to, 'cml/cml_metadata.csv'), index_col=0)
