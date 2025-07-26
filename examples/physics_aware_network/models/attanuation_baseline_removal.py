@@ -49,8 +49,11 @@ class AttenuationBaselineRemoval(nn.Module):
     """
     CNN-based model to estimate and remove the baseline from an attenuation signal,
     using a StyleGAN-like approach for metadata fusion via AdaIN.
+    input x is of shape (batch_size, 1, time_samples)
+    input metadata is of shape (batch_size, metadata_features)
+    output is of shape (batch_size, 1, time_samples)
     """
-    def __init__(self, metadata_features, style_vector_dim):
+    def __init__(self, metadata_features):
         super().__init__()
         
         # Total channels for all AdaIN layers
@@ -64,13 +67,13 @@ class AttenuationBaselineRemoval(nn.Module):
         self.conv2 = nn.Conv1d(32, 64, kernel_size=5, padding='same')
         self.adain2 = AdaIN()
         
-        self.conv3 = nn.Conv1d(64, 64, kernel_size=15, padding='same')
+        self.conv3 = nn.Conv1d(64, 64, kernel_size=10, padding='same')
         self.adain3 = AdaIN()
         
-        self.conv4 = nn.Conv1d(64, 128, kernel_size=100, padding='same')
+        self.conv4 = nn.Conv1d(64, 128, kernel_size=15, padding='same')
         self.adain4 = AdaIN()
         
-        self.conv5 = nn.Conv1d(128, 128, kernel_size=900, padding='same')
+        self.conv5 = nn.Conv1d(128, 128, kernel_size=20, padding='same')
         self.adain5 = AdaIN()
         
         self.conv6 = nn.Conv1d(128, 64, kernel_size=1, padding='same')
@@ -110,3 +113,41 @@ class AttenuationBaselineRemoval(nn.Module):
         
         return output
 
+
+
+def day_median_baseline_removal(attenuation):
+    """
+    attenuation is of shape (batch_size, 1, time_samples)
+    return the baseline of shape (batch_size, 1, time_samples)
+    """
+    batch_size, _, time_samples = attenuation.shape
+    attenuation = attenuation.view(batch_size, -1) # (batch_size, time_samples)
+    nof_samples_in_day = 60*24*6 # minutes * hours * samples per minute (10 sec sample)
+    # attenuation = attenuation.reshape([batch_size, nof_samples_in_day, -1])
+    # Handle edge case for last day residual which is less than one day
+    total_samples = time_samples
+    samples_per_day = nof_samples_in_day
+    num_full_days = total_samples // samples_per_day
+    residual_samples = total_samples % samples_per_day
+
+    if residual_samples > 0:
+        # Process the full days as before
+        full_days_shape = [batch_size, num_full_days, samples_per_day]
+        full_days = attenuation[:, :num_full_days * samples_per_day].reshape(full_days_shape)
+        baseline_full = torch.median(full_days, dim=-1, keepdim=True)[0]
+        compensated_full = full_days - baseline_full
+        compensated_full = compensated_full.reshape(batch_size, 1, num_full_days * samples_per_day)
+
+        # Process the residual samples
+        residual = attenuation[:, num_full_days * samples_per_day:]
+        baseline_residual = torch.median(residual, dim=-1, keepdim=True)[0]
+        compensated_residual = residual - baseline_residual
+        compensated_residual = compensated_residual.reshape(batch_size, 1, residual_samples)
+
+        # Concatenate the compensated full days and residual
+        attenuation_compensated = torch.cat([compensated_full, compensated_residual], dim=2)
+    else:
+        # No residual, just return as before
+        attenuation_compensated = attenuation_compensated
+
+    return attenuation_compensated

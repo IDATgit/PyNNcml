@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from .attanuation_baseline_removline import AttenuationBaselineRemoval
+from .simple_baseline_removal import SimpleBaselineRemoval
 from .attanuation_to_rain_rate import AttenuationToRainRate
 
 class PhysicsInformedRainEstimation(nn.Module):
@@ -9,18 +9,16 @@ class PhysicsInformedRainEstimation(nn.Module):
     1. Attenuation baseline removal.
     2. Conversion of the compensated attenuation to rain rate.
     """
-    def __init__(self, metadata_features_baseline, style_vector_dim_baseline,
-                 metadata_features_rain_rate, style_vector_dim_rain_rate):
+    def __init__(self, metadata_features, window_hours=24):
         super().__init__()
         
-        self.baseline_remover = AttenuationBaselineRemoval(
-            metadata_features=metadata_features_baseline,
-            style_vector_dim=style_vector_dim_baseline
+        self.baseline_remover = SimpleBaselineRemoval(
+            metadata_features=metadata_features,
+            window_hours=window_hours
         )
         
         self.rain_rate_estimator = AttenuationToRainRate(
-            metadata_features=metadata_features_rain_rate,
-            style_vector_dim=style_vector_dim_rain_rate
+            metadata_features=metadata_features
         )
 
     def forward(self, attenuation_signal, metadata):
@@ -29,35 +27,30 @@ class PhysicsInformedRainEstimation(nn.Module):
         
         Args:
             attenuation_signal (torch.Tensor): The input attenuation signal of shape [B, 1, L].
-            metadata (torch.Tensor): The corresponding metadata for the links.
+            metadata (torch.Tensor): The corresponding metadata for the links.shape is [B, metadata_features]
         
         Returns:
-            torch.Tensor: The final estimated rain rate.
-            torch.Tensor: The intermediate rain-related attenuation signal.
+            rain_related_attenuation (torch.Tensor): The intermediate rain-related attenuation signal. shape is [B, 1, L]
+            estimated_rain_rate (torch.Tensor): The final estimated rain rate. shape is [B, 1, L]
         """
         # Step 1: Estimate and remove the baseline attenuation
         baseline_attenuation = self.baseline_remover(attenuation_signal, metadata)
         rain_related_attenuation = attenuation_signal - baseline_attenuation
-        
-        # Ensure the compensated attenuation is non-negative
-        rain_related_attenuation = torch.relu(rain_related_attenuation)
         
         # Step 2: Convert the compensated attenuation to rain rate
         # The rain rate model expects a single value per sample, but our signal is a time series.
         # We process each time step individually by reshaping the batch.
         
         B, C, L = rain_related_attenuation.shape
-        # Reshape for processing: (B, L, C) -> (B * L, C)
-        rain_related_attenuation_reshaped = rain_related_attenuation.permute(0, 2, 1).reshape(B * L, C)
         
-        # Expand metadata to match the new batch dimension: (B, F) -> (B, L, F) -> (B * L, F)
-        metadata_features = metadata.shape[1]
-        metadata_expanded = metadata.unsqueeze(1).expand(-1, L, -1).reshape(B * L, metadata_features)
-
         # Estimate rain rate on the reshaped tensor
-        estimated_rain_rate_reshaped = self.rain_rate_estimator(rain_related_attenuation_reshaped, metadata_expanded)
+        estimated_rain_rate = self.rain_rate_estimator(rain_related_attenuation, metadata)
 
-        # Reshape back to sequence format: (B * L, C) -> (B, L, C) -> (B, C, L)
-        estimated_rain_rate = estimated_rain_rate_reshaped.reshape(B, L, C).permute(0, 2, 1)
+        # Apply ReLU during evaluation to ensure physically meaningful outputs
+        if not self.training:
+            # Compensated attenuation should be non-negative (no negative rain-related attenuation)
+            rain_related_attenuation = torch.relu(rain_related_attenuation)
+            # Rain rate should be non-negative (no negative rainfall)
+            estimated_rain_rate = torch.relu(estimated_rain_rate)
         
-        return estimated_rain_rate, rain_related_attenuation 
+        return rain_related_attenuation, estimated_rain_rate

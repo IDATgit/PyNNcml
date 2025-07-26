@@ -28,30 +28,15 @@ CHECKPOINT_DIR = os.path.join(script_dir, '..', 'results', 'checkpoints')
 TENSORBOARD_DIR = os.path.join(script_dir, '..', 'results', 'tensorboard')
 PLOT_DIR = os.path.join(script_dir, '..', 'results', 'training_plots')
 
-# --- Helper Functions ---
-def prepare_batch(batch, device):
-    """Prepares a batch for model input and calculates attenuation."""
-    rain, rsl, tsl, metadata = batch
-    rain, rsl, tsl, metadata = rain.to(device), rsl.to(device), tsl.to(device), metadata.to(device)
-    
-    # Calculate attenuation: A = TSL - RSL
-    # Taking the mean of the 10s samples to get a 15-min value
-    attenuation = torch.mean(tsl, dim=2) - torch.mean(rsl, dim=2)
-    attenuation = attenuation.unsqueeze(1).float() # Add channel dimension
-    
-    # Average the rain gauge data if multiple are present
-    rain_rate_target = torch.nan_to_num(rain[:, :, 0]).unsqueeze(1).float()
-
-    return attenuation, metadata, rain_rate_target
-
 def custom_loss_function(predicted_rain, target_rain, compensated_attenuation, dry_wet_ratio, regularization_weight):
     """
     Custom loss function.
     - Weighted L2 loss for rain rate (MSE).
     - Regularization term for compensated attenuation during dry periods.
     """
+    batch_size, time_samples, n_samples = compensated_attenuation.shape
     # Identify dry/wet samples
-    is_wet = target_rain > 0.1
+    is_wet = target_rain == 0
     
     # Calculate weighted L2 loss for rain rate
     weights = torch.ones_like(target_rain)
@@ -62,6 +47,29 @@ def custom_loss_function(predicted_rain, target_rain, compensated_attenuation, d
     # Calculate regularization loss for dry periods
     dry_attenuation = compensated_attenuation[~is_wet]
     regularization_loss = torch.mean(dry_attenuation**2)
+    attenuation_flat = compensated_attenuation.view(batch_size, -1)  # (batch_size, time_samples * n_samples)
+    # Reshape to (batch_size, num_24h_chunks, samples_per_24h)
+    samples_per_24h = 24 * 60  # 24 hours * 60 minutes
+    num_chunks = attenuation_flat.shape[1] // samples_per_24h
+    if num_chunks > 0:
+        # Reshape to handle complete 24h chunks
+        chunks = attenuation_flat[:, :num_chunks*samples_per_24h].view(batch_size, num_chunks, samples_per_24h)
+        # Calculate median per 24h chunk
+        baseline = torch.median(chunks, dim=2, keepdim=True)[0]  # (batch_size, num_chunks, 1)
+        # Repeat the baseline for each minute in the 24h period
+        baseline = baseline.repeat(1, 1, samples_per_24h)
+        # Reshape back to match original flat shape
+        baseline = baseline.view(batch_size, num_chunks*samples_per_24h)
+        
+        # Handle remaining samples if any
+        if attenuation_flat.shape[1] > num_chunks*samples_per_24h:
+            remaining = attenuation_flat[:, num_chunks*samples_per_24h:]
+            remaining_baseline = torch.median(remaining, dim=1, keepdim=True)[0]
+            baseline = torch.cat([baseline, remaining_baseline.repeat(1, remaining.shape[1])], dim=1)
+    else:
+        # If less than 24h of data, use single median
+        baseline = torch.median(attenuation_flat, dim=1, keepdim=True)[0]
+        baseline = baseline.view(batch_size, time_samples, n_samples)
     
     # Combine losses
     total_loss = weighted_rain_loss + regularization_weight * regularization_loss
@@ -106,8 +114,10 @@ class TwoStageModelTrainer:
             total_train_loss, total_rain_loss, total_reg_loss = 0, 0, 0
 
             for i, batch in enumerate(self.train_loader):
-                attenuation, metadata, rain_target = prepare_batch(batch, self.device)
-                
+                rain, rsl, tsl, metadata = batch
+                rain, rsl, tsl, metadata = rain.to(self.device), rsl.to(self.device), tsl.to(self.device), metadata.to(self.device)
+                attenuation = tsl - rsl
+
                 # Forward pass
                 predicted_rain, compensated_att = self.model(attenuation, metadata)
                 
